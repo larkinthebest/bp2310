@@ -3,11 +3,16 @@ import sys
 from dotenv import load_dotenv
 
 # Load env before imports
+print("DEBUG: Loading .env file...")
 load_dotenv()
 
+print("DEBUG: Importing MultimodalLoader...")
 from src.ingestion.multimodal_loader import MultimodalLoader
+print("DEBUG: Importing VectorStore...")
 from src.rag.vector_store import VectorStore
+print("DEBUG: Importing RAGPipeline...")
 from src.rag.pipeline import RAGPipeline
+print("DEBUG: Importing Metrics...")
 from src.eval.metrics import check_ragas_metrics
 
 import json

@@ -3,6 +3,7 @@ from ragas.metrics import (
     faithfulness,
     answer_relevancy,
     context_precision,
+    context_recall,
 )
 from datasets import Dataset
 import os
@@ -32,10 +33,8 @@ def run_evaluation():
     for q in questions:
         # Note: This assumes the vector store is already populated
         result = pipeline.query(q)
-        answers.append(result)
-        # In a real scenario, you'd extract retrieved contexts from the chain result
-        # For now, we'll mock contexts or you need to modify pipeline to return them
-        contexts.append(["Mock context retrieved from vector store"]) 
+        answers.append(result["answer"])
+        contexts.append(result["contexts"]) 
 
     # 4. Prepare Dataset
     data = {
@@ -53,6 +52,7 @@ def run_evaluation():
             faithfulness,
             answer_relevancy,
             context_precision,
+            context_recall,
         ],
     )
     
