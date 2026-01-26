@@ -113,3 +113,38 @@ class VectorStore:
             top_k=k,
             include_metadata=True
         )
+
+    def rerank(self, query: str, documents: List[str], top_n: int = 3) -> List[Dict[str, Any]]:
+        """
+        Rerank documents using Pinecone's reranker model.
+        
+        Args:
+            query: The search query
+            documents: List of document texts to rerank
+            top_n: Number of top results to return
+            
+        Returns:
+            List of reranked results with 'index' and 'score' keys
+        """
+        if not documents:
+            return []
+        
+        # Truncate documents to ~800 chars to stay under 1024 token limit
+        max_chars = 800
+        truncated_docs = [doc[:max_chars] if len(doc) > max_chars else doc for doc in documents]
+        
+        try:
+            results = self.pc.inference.rerank(
+                model="bge-reranker-v2-m3",
+                query=query,
+                documents=truncated_docs,
+                top_n=top_n,
+                return_documents=True
+            )
+            # Convert to list of dicts for consistent access
+            return [{"index": r.index, "score": r.score} for r in results.data]
+        except Exception as e:
+            print(f"Warning: Reranking failed: {e}. Returning original order.")
+            # Fallback: return documents in original order with dummy scores
+            return [{"index": i, "score": 1.0} for i in range(min(top_n, len(documents)))]
+

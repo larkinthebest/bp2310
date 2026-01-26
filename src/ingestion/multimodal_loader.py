@@ -71,10 +71,7 @@ class MultimodalLoader:
             image = Image.fromarray(frame)
             embedding = self.get_clip_embedding(image)
             
-            # For Pinecone, we store the embedding directly. 
-            # Since LangChain Document is text-based, we'll store a placeholder text 
-            # and attach the embedding in metadata (or handle it in VectorStore).
-            # Here we just return a Document with special metadata.
+        
             documents.append(Document(
                 page_content=f"Video Frame at {t}s", 
                 metadata={

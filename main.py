@@ -24,7 +24,8 @@ def load_processed_files():
         try:
             with open(TRACKING_FILE, 'r') as f:
                 return set(json.load(f))
-        except:
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load tracking file: {e}")
             return set()
     return set()
 
@@ -88,24 +89,83 @@ def chat_loop(vector_store: VectorStore):
         
         try:
             print("Thinking...")
-            result = pipeline.query(question)
-            answer = result["answer"]
-            contexts = result["contexts"]
-            print(f"\nAI: {answer}")
             
-            # RAGAS Evaluation
-            print("\nComputing RAGAS Metrics (Faithfulness, Answer Relevance)...")
-            scores = check_ragas_metrics(question, answer, contexts)
-            # print(f"DEBUG Scores: {scores}") # Valid debug line if needed
+            # === Standard Retrieval (No Reranking) ===
+            print("\n" + "="*50)
+            print("=== STANDARD RETRIEVAL (No Reranking) ===")
+            print("="*50)
             
-            if "error" in scores:
-                print(f"RAGAS Error: {scores['error']}")
+            result_standard = pipeline.query(question, use_reranking=False)
+            answer_standard = result_standard["answer"]
+            contexts_standard = result_standard["contexts"]
+            sources_standard = result_standard.get("sources", [])
+            
+            print(f"\nAI: {answer_standard}")
+            if sources_standard:
+                print(f"Sources: {', '.join(sources_standard)}")
+            
+            print("\nComputing RAGAS Metrics...")
+            scores_standard = check_ragas_metrics(question, answer_standard, contexts_standard)
+            
+            if "error" in scores_standard:
+                print(f"RAGAS Error: {scores_standard['error']}")
+                faith_std = rel_std = prec_std = rec_std = 0
             else:
-                print("\n--- RAGAS Scores ---")
-                print(f"Faithfulness: {scores.get('faithfulness', 0):.4f}")
-                print(f"Answer Relevancy: {scores.get('answer_relevancy', 0):.4f}")
-                print(f"Context Precision: {scores.get('context_precision', 0):.4f}")
-                print(f"Context Recall: {scores.get('context_recall', 0):.4f}")
+                faith_std = scores_standard.get('faithfulness', 0)
+                rel_std = scores_standard.get('answer_relevancy', 0)
+                prec_std = scores_standard.get('context_precision', 0)
+                rec_std = scores_standard.get('context_recall', 0)
+                
+                print(f"Faithfulness: {faith_std:.4f} | Relevancy: {rel_std:.4f}")
+                print(f"Context Precision: {prec_std:.4f} | Context Recall: {rec_std:.4f}")
+            
+            # === Reranker-Enhanced Retrieval ===
+            print("\n" + "="*50)
+            print("=== RERANKER-ENHANCED RETRIEVAL ===")
+            print("="*50)
+            
+            result_reranked = pipeline.query(question, use_reranking=True)
+            answer_reranked = result_reranked["answer"]
+            contexts_reranked = result_reranked["contexts"]
+            sources_reranked = result_reranked.get("sources", [])
+            
+            print(f"\nAI: {answer_reranked}")
+            if sources_reranked:
+                print(f"Sources: {', '.join(sources_reranked)}")
+            
+            print("\nComputing RAGAS Metrics...")
+            scores_reranked = check_ragas_metrics(question, answer_reranked, contexts_reranked)
+            
+            if "error" in scores_reranked:
+                print(f"RAGAS Error: {scores_reranked['error']}")
+                faith_rr = rel_rr = prec_rr = rec_rr = 0
+            else:
+                faith_rr = scores_reranked.get('faithfulness', 0)
+                rel_rr = scores_reranked.get('answer_relevancy', 0)
+                prec_rr = scores_reranked.get('context_precision', 0)
+                rec_rr = scores_reranked.get('context_recall', 0)
+                
+                print(f"Faithfulness: {faith_rr:.4f} | Relevancy: {rel_rr:.4f}")
+                print(f"Context Precision: {prec_rr:.4f} | Context Recall: {rec_rr:.4f}")
+            
+            # === Comparison Summary ===
+            print("\n" + "="*50)
+            print("=== COMPARISON SUMMARY ===")
+            print("="*50)
+            
+            faith_diff = faith_rr - faith_std
+            rel_diff = rel_rr - rel_std
+            
+            print(f"Faithfulness: Standard={faith_std:.4f} | Reranked={faith_rr:.4f} | Diff={faith_diff:+.4f}")
+            print(f"Relevancy:    Standard={rel_std:.4f} | Reranked={rel_rr:.4f} | Diff={rel_diff:+.4f}")
+            
+            # Determine winner
+            if rel_rr > rel_std and faith_rr >= faith_std:
+                print("\n✅ Reranker improved the answer quality!")
+            elif rel_std > rel_rr and faith_std >= faith_rr:
+                print("\n⚠️ Standard retrieval performed better this time.")
+            else:
+                print("\n➡️ Mixed results - check individual metrics above.")
                 
         except Exception as e:
             print(f"Error during query: {repr(e)}")

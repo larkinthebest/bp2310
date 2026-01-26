@@ -7,8 +7,8 @@ from ragas.metrics import (
 )
 from datasets import Dataset
 import os
-from rag.pipeline import RAGPipeline
-from rag.vector_store import VectorStore
+from src.rag.pipeline import RAGPipeline
+from src.rag.vector_store import VectorStore
 
 def run_evaluation():
     # 1. Setup

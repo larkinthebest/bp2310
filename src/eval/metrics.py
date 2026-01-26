@@ -56,9 +56,7 @@ def check_ragas_metrics(question, answer, contexts):
             print(f"DEBUG: Error converting results to pandas: {e}")
             import traceback
             traceback.print_exc()
-            # Emergency fallback: parse string representation? No, that's too brittle.
-            # Try accessing .scores if it exists
-            return {} 
+            return {"error": f"Failed to convert results: {e}"} 
             
     except Exception as e:
         print(f"DEBUG: Error inside evaluate: {e}")
