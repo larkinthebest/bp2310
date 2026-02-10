@@ -64,9 +64,9 @@ class MultimodalLoader:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
         
-        # 2. Extract frames (e.g., every 5 seconds)
+        # 2. Extract frames (e.g., every 2 seconds)
         duration = video.duration
-        for t in range(0, int(duration), 5):
+        for t in range(0, int(duration), 2):
             frame = video.get_frame(t)
             image = Image.fromarray(frame)
             embedding = self.get_clip_embedding(image)
