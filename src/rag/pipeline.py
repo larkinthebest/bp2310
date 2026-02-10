@@ -5,6 +5,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langfuse.langchain import CallbackHandler
 import os
 import re
+import json
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
@@ -12,8 +13,11 @@ import torch
 class RAGPipeline:
     def __init__(self, vector_store):
         self.vector_store = vector_store
-        self.llm = ChatOpenAI(model="gpt-4o-mini")
+        model_name = os.getenv("LLM_MODEL", "gpt-5-mini")
+        print(f"Using LLM model: {model_name}")
+        self.llm = ChatOpenAI(model=model_name)
         self.langfuse_handler = CallbackHandler()
+        self.video_top_k = int(os.getenv("VIDEO_TOP_K", "30"))
         
         # Initialize CLIP for query embedding
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
@@ -63,7 +67,7 @@ class RAGPipeline:
         
         # 3. Video Retrieval (CLIP Embeddings) - separate modality, no text reranking
         query_embedding = self.get_clip_text_embedding(question)
-        video_results = self.vector_store.search_video(query_embedding, k=2)
+        video_results = self.vector_store.search_video(query_embedding, k=self.video_top_k)
         
         # Return raw matches for video
         video_matches = video_results.get('matches', [])
@@ -94,13 +98,43 @@ class RAGPipeline:
         for match in video_matches:
             meta = match['metadata']
             src = os.path.basename(meta.get("source", "unknown"))
+            caption = meta.get("caption", "Visual content")
+            raw_sb = meta.get("scoreboard")
+            sb = {}
+            if isinstance(raw_sb, str):
+                try:
+                    sb = json.loads(raw_sb)
+                except Exception:
+                    sb = {}
+            elif isinstance(raw_sb, dict):
+                sb = raw_sb
+            sb_text = ""
+            if isinstance(sb, dict):
+                # Build a compact scoreboard string if numbers exist
+                h_team = sb.get("home_team")
+                a_team = sb.get("away_team")
+                h_score = sb.get("home_score")
+                a_score = sb.get("away_score")
+                h_shots = sb.get("home_shots")
+                a_shots = sb.get("away_shots")
+                clock = sb.get("clock")
+                period = sb.get("period")
+                parts = []
+                if h_team or a_team:
+                    parts.append(f"{a_team or 'Away'} {a_score or '?'} vs {h_team or 'Home'} {h_score or '?'}")
+                if h_shots or a_shots:
+                    parts.append(f"Shots: {a_shots or '?'}–{h_shots or '?'} (away–home)")
+                if period or clock:
+                    parts.append(f"{period or ''} {clock or ''}".strip())
+                if parts:
+                    sb_text = " | ".join(parts)
             
             if meta.get('type') == 'video_frame':
-                video_context_strs.append(f"[Source: {src}] [Video Frame] at {meta.get('timestamp')}s")
+                video_context_strs.append(f"[Source: {src}] [Video Frame {meta.get('timestamp')}s] {caption} {sb_text}".strip())
             elif meta.get('type') == 'image':
-                video_context_strs.append(f"[Source: {src}] [Image]")
+                video_context_strs.append(f"[Source: {src}] [Image] {caption} {sb_text}".strip())
             else:
-                 video_context_strs.append(f"[Source: {src}] [Visual]")
+                 video_context_strs.append(f"[Source: {src}] [Visual] {caption} {sb_text}".strip())
         
         full_context = "\n\n".join(context_parts + video_context_strs)
         

@@ -5,6 +5,7 @@ import os
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
+import os
 
 def check_ragas_metrics(question, answer, contexts):
     """
@@ -27,7 +28,8 @@ def check_ragas_metrics(question, answer, contexts):
     
     dataset = Dataset.from_dict(data)
     
-    evaluator_llm = ChatOpenAI(model="gpt-4o-mini")
+    eval_model = os.getenv("EVAL_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    evaluator_llm = ChatOpenAI(model=eval_model)
     evaluator_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(model="text-embedding-3-small"))
     
     try:

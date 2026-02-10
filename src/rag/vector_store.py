@@ -72,7 +72,10 @@ class VectorStore:
                 video_vectors.append({
                     "id": vector_id,
                     "values": doc.metadata["embedding"],
-                    "metadata": {k: v for k, v in doc.metadata.items() if k != "embedding"}
+                    "metadata": {
+                        **{k: v for k, v in doc.metadata.items() if k != "embedding"},
+                        "caption": doc.page_content
+                    }
                 })
             elif doc_type == "audio" or doc_type == "video_audio":
                 audio_docs.append(doc)
