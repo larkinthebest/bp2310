@@ -1,5 +1,5 @@
 import os
-from typing import List, Union, Tuple, Optional, Dict
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from langchain_core.documents import Document
 import openai
 from moviepy.editor import VideoFileClip
@@ -21,7 +21,7 @@ class MultimodalLoader:
         self.model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
+        cast(Any, self.model).to(self.device)
         print(f"CLIP model loaded on {self.device}")
 
     def _encode_image(self, image: Image.Image) -> str:
@@ -30,7 +30,7 @@ class MultimodalLoader:
         image.convert("RGB").save(buf, format="JPEG", quality=85)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    def caption_image(self, image: Image.Image) -> Tuple[str, Optional[Dict[str, str]]]:
+    def caption_image(self, image: Image.Image) -> Tuple[str, Optional[Dict[str, Optional[str]]]]:
         """
         Creates a short, descriptive caption using OpenAI Vision.
         Additionally, if a scoreboard is visible, ask for structured fields.
@@ -39,7 +39,7 @@ class MultimodalLoader:
         try:
             b64 = self._encode_image(image)
             resp = openai.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5-mini",
                 messages=[{
                     "role": "user",
                     "content": [
@@ -58,7 +58,15 @@ class MultimodalLoader:
                 }],
                 max_tokens=120,
             )
-            content = resp.choices[0].message.content.strip()
+            message_content = resp.choices[0].message.content
+            if isinstance(message_content, list):
+                content = "".join(
+                    part.get("text", "")
+                    for part in message_content
+                    if isinstance(part, dict)
+                ).strip()
+            else:
+                content = (message_content or "").strip()
             # Strip common markdown fences
             if content.startswith("```"):
                 content = content.strip("`")
@@ -73,8 +81,16 @@ class MultimodalLoader:
                     content = content[start:end+1]
             try:
                 data = json.loads(content)
-                caption = data.get("caption", "").strip() or "Visual content"
-                scoreboard = {k: v for k, v in data.items() if k != "caption"}
+                if not isinstance(data, dict):
+                    raise ValueError("Vision response was not a JSON object")
+                raw_caption = data.get("caption", "")
+                caption = raw_caption.strip() if isinstance(raw_caption, str) else str(raw_caption).strip()
+                caption = caption or "Visual content"
+                scoreboard = {
+                    str(k): (v if isinstance(v, str) or v is None else str(v))
+                    for k, v in data.items()
+                    if k != "caption"
+                }
                 # normalize empty strings to None
                 scoreboard = {k: (v if v not in ("", None) else None) for k, v in scoreboard.items()}
                 return caption, scoreboard
@@ -92,9 +108,9 @@ class MultimodalLoader:
         else:
             image = image_input
             
-        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        inputs = cast(Any, self.processor)(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            image_features = self.model.get_image_features(**inputs)
+            image_features = cast(Any, self.model).get_image_features(**inputs)
         
         # Normalize
         image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
@@ -112,17 +128,19 @@ class MultimodalLoader:
     def process_video(self, video_path: str) -> List[Document]:
         """Processes video by extracting audio and frames."""
         video = VideoFileClip(video_path)
-        documents = []
+        documents: List[Document] = []
         
         # 1. Extract and transcribe audio
         audio_path = f"{video_path}.mp3"
         try:
-            video.audio.write_audiofile(audio_path, verbose=False, logger=None)
-            audio_text = self.process_audio(audio_path)
-            documents.append(Document(
-                page_content=f"Video Transcription: {audio_text}", 
-                metadata={"source": video_path, "type": "video_audio"}
-            ))
+            audio = video.audio
+            if audio is not None:
+                audio.write_audiofile(audio_path, verbose=False, logger=None)
+                audio_text = self.process_audio(audio_path)
+                documents.append(Document(
+                    page_content=f"Video Transcription: {audio_text}",
+                    metadata={"source": video_path, "type": "video_audio"}
+                ))
         except Exception as e:
             print(f"Error processing video audio: {e}")
         finally:

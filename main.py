@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Any
 from dotenv import load_dotenv
 
 # Load env before imports
@@ -18,6 +19,16 @@ from src.eval.metrics import check_ragas_metrics
 import json
 
 TRACKING_FILE = "processed_files.json"
+
+
+def metric_value(scores: dict[str, Any], key: str) -> float:
+    value = scores.get(key, 0.0)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 def load_processed_files():
     if os.path.exists(TRACKING_FILE):
@@ -109,12 +120,12 @@ def chat_loop(vector_store: VectorStore):
             
             if "error" in scores_standard:
                 print(f"RAGAS Error: {scores_standard['error']}")
-                faith_std = rel_std = prec_std = rec_std = 0
+                faith_std = rel_std = prec_std = rec_std = 0.0
             else:
-                faith_std = scores_standard.get('faithfulness', 0)
-                rel_std = scores_standard.get('answer_relevancy', 0)
-                prec_std = scores_standard.get('context_precision', 0)
-                rec_std = scores_standard.get('context_recall', 0)
+                faith_std = metric_value(scores_standard, "faithfulness")
+                rel_std = metric_value(scores_standard, "answer_relevancy")
+                prec_std = metric_value(scores_standard, "context_precision")
+                rec_std = metric_value(scores_standard, "context_recall")
                 
                 print(f"Faithfulness: {faith_std:.4f} | Relevancy: {rel_std:.4f}")
                 print(f"Context Precision: {prec_std:.4f} | Context Recall: {rec_std:.4f}")
@@ -138,12 +149,12 @@ def chat_loop(vector_store: VectorStore):
             
             if "error" in scores_reranked:
                 print(f"RAGAS Error: {scores_reranked['error']}")
-                faith_rr = rel_rr = prec_rr = rec_rr = 0
+                faith_rr = rel_rr = prec_rr = rec_rr = 0.0
             else:
-                faith_rr = scores_reranked.get('faithfulness', 0)
-                rel_rr = scores_reranked.get('answer_relevancy', 0)
-                prec_rr = scores_reranked.get('context_precision', 0)
-                rec_rr = scores_reranked.get('context_recall', 0)
+                faith_rr = metric_value(scores_reranked, "faithfulness")
+                rel_rr = metric_value(scores_reranked, "answer_relevancy")
+                prec_rr = metric_value(scores_reranked, "context_precision")
+                rec_rr = metric_value(scores_reranked, "context_recall")
                 
                 print(f"Faithfulness: {faith_rr:.4f} | Relevancy: {rel_rr:.4f}")
                 print(f"Context Precision: {prec_rr:.4f} | Context Recall: {rec_rr:.4f}")
