@@ -5,7 +5,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langfuse.langchain import CallbackHandler
 import os
 import re
-import json
+from collections import defaultdict
+
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
@@ -32,12 +33,76 @@ class RAGPipeline:
         text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         return text_features.cpu().numpy()[0].tolist()
 
-    def hybrid_retrieval(self, question: str, top_k: int = 3, use_reranking: bool = True):
-        # 1. Text & Audio Retrieval (OpenAI Embeddings)
-        # Retrieve more candidates if reranking is enabled
+    def _expand_query(self, question: str) -> str:
+        """Use LLM to expand the user's query with sports-specific terms for better retrieval."""
+        try:
+            expansion_prompt = ChatPromptTemplate.from_template(
+                "You are a sports search assistant. Given the user's question, generate a short list of "
+                "additional sports-specific keywords and synonyms that would help find relevant content. "
+                "Include terms for: player actions, match events, tactical terms, and common commentary phrases. "
+                "Return ONLY the keywords separated by spaces, no explanations. Keep it under 30 words.\n\n"
+                "Question: {question}\n\nKeywords:"
+            )
+            chain = expansion_prompt | self.llm | StrOutputParser()
+            keywords = chain.invoke({"question": question})
+            expanded = f"{question} {keywords.strip()}"
+            print(f"  Query expanded: '{question}' → +[{keywords.strip()}]")
+            return expanded
+        except Exception as e:
+            print(f"  Warning: query expansion failed: {e}")
+            return question
+
+    def _group_temporal_context(self, video_matches) -> list[str]:
+        """
+        Group video frames by source file, sort by timestamp, and produce
+        scene-block strings so the LLM sees a coherent narrative per video.
+        """
+        # Bucket frames by source
+        source_frames = defaultdict(list)
+        for match in video_matches:
+            meta = match['metadata']
+            src = meta.get("source", "unknown")
+            caption = meta.get("caption", "Visual content")
+            timestamp = meta.get("timestamp", 0)
+            source_frames[src].append((timestamp, caption))
+
+        context_strs = []
+        for src, frames in source_frames.items():
+            basename = os.path.basename(src)
+            # Sort frames chronologically
+            frames.sort(key=lambda x: x[0])
+
+            # Group consecutive frames into scenes (gap > 2× interval = new scene)
+            interval = float(os.getenv("VIDEO_FRAME_INTERVAL_SECONDS", "3"))
+            max_gap = interval * 2.5  # allow small gaps before splitting
+
+            scenes = []
+            current_scene = [frames[0]]
+            for i in range(1, len(frames)):
+                if frames[i][0] - frames[i - 1][0] <= max_gap:
+                    current_scene.append(frames[i])
+                else:
+                    scenes.append(current_scene)
+                    current_scene = [frames[i]]
+            scenes.append(current_scene)
+
+            for scene in scenes:
+                start_t = scene[0][0]
+                end_t = scene[-1][0]
+                header = f"[Source: {basename}] [Scene: {start_t}s – {end_t}s]"
+                body_lines = [f"  [{t}s] {cap}" for t, cap in scene]
+                context_strs.append(header + "\n" + "\n".join(body_lines))
+
+        return context_strs
+
+    def hybrid_retrieval(self, question: str, top_k: int = 5, use_reranking: bool = True):
+        # --- Query Expansion for text/audio retrieval ---
+        expanded_question = self._expand_query(question)
+
+        # 1. Text & Audio Retrieval (OpenAI Embeddings) — use expanded query
         candidate_k = top_k * 3 if use_reranking else top_k
         
-        search_results = self.vector_store.search(question, k=candidate_k)
+        search_results = self.vector_store.search(expanded_question, k=candidate_k)
         text_docs = search_results.get("text", [])
         audio_docs = search_results.get("audio", [])
         
@@ -45,14 +110,12 @@ class RAGPipeline:
         if use_reranking:
             all_text_docs = text_docs + audio_docs
             if all_text_docs:
-                # Prepare documents for reranking
                 doc_texts = [doc.page_content for doc in all_text_docs]
                 
-                # Rerank using Pinecone
+                # Rerank against the ORIGINAL question (not expanded) for precision
                 print(f"Reranking {len(doc_texts)} text/audio documents...")
                 reranked_results = self.vector_store.rerank(question, doc_texts, top_n=top_k)
                 
-                # Map reranked results back to original documents
                 reranked_docs = []
                 for result in reranked_results:
                     original_idx = result["index"]
@@ -61,15 +124,13 @@ class RAGPipeline:
                         doc.metadata["rerank_score"] = result["score"]
                         reranked_docs.append(doc)
                 
-                # Split back into text and audio based on type
                 text_docs = [d for d in reranked_docs if d.metadata.get("type") != "audio" and d.metadata.get("type") != "video_audio"]
                 audio_docs = [d for d in reranked_docs if d.metadata.get("type") in ["audio", "video_audio"]]
         
-        # 3. Video Retrieval (CLIP Embeddings) - separate modality, no text reranking
+        # 3. Video Retrieval (CLIP Embeddings) — use ORIGINAL question (CLIP prefers short queries)
         query_embedding = self.get_clip_text_embedding(question)
         video_results = self.vector_store.search_video(query_embedding, k=self.video_top_k)
         
-        # Return raw matches for video
         video_matches = video_results.get('matches', [])
                 
         return text_docs, audio_docs, video_matches
@@ -93,48 +154,8 @@ class RAGPipeline:
             src = os.path.basename(d.metadata.get("source", "unknown"))
             context_parts.append(f"[Source: {src}] [Audio Transcript]\n{d.page_content}")
         
-        # Video Context
-        video_context_strs = []
-        for match in video_matches:
-            meta = match['metadata']
-            src = os.path.basename(meta.get("source", "unknown"))
-            caption = meta.get("caption", "Visual content")
-            raw_sb = meta.get("scoreboard")
-            sb = {}
-            if isinstance(raw_sb, str):
-                try:
-                    sb = json.loads(raw_sb)
-                except Exception:
-                    sb = {}
-            elif isinstance(raw_sb, dict):
-                sb = raw_sb
-            sb_text = ""
-            if isinstance(sb, dict):
-                # Build a compact scoreboard string if numbers exist
-                h_team = sb.get("home_team")
-                a_team = sb.get("away_team")
-                h_score = sb.get("home_score")
-                a_score = sb.get("away_score")
-                h_shots = sb.get("home_shots")
-                a_shots = sb.get("away_shots")
-                clock = sb.get("clock")
-                period = sb.get("period")
-                parts = []
-                if h_team or a_team:
-                    parts.append(f"{a_team or 'Away'} {a_score or '?'} vs {h_team or 'Home'} {h_score or '?'}")
-                if h_shots or a_shots:
-                    parts.append(f"Shots: {a_shots or '?'}–{h_shots or '?'} (away–home)")
-                if period or clock:
-                    parts.append(f"{period or ''} {clock or ''}".strip())
-                if parts:
-                    sb_text = " | ".join(parts)
-            
-            if meta.get('type') == 'video_frame':
-                video_context_strs.append(f"[Source: {src}] [Video Frame {meta.get('timestamp')}s] {caption} {sb_text}".strip())
-            elif meta.get('type') == 'image':
-                video_context_strs.append(f"[Source: {src}] [Image] {caption} {sb_text}".strip())
-            else:
-                 video_context_strs.append(f"[Source: {src}] [Visual] {caption} {sb_text}".strip())
+        # Video Context — grouped into temporal scene blocks
+        video_context_strs = self._group_temporal_context(video_matches)
         
         full_context = "\n\n".join(context_parts + video_context_strs)
         
@@ -144,17 +165,21 @@ class RAGPipeline:
             question_text += f"\n\nContext Note: A previous answer to this question was not relevant enough. Feedback: {feedback}\nPlease improve the answer based on this feedback."
 
         # Generate Answer
-        template = """Answer the question based on the following context. 
-        Each context chunk starts with [Source: filename].
+        template = """You are an expert sports commentator and analyst. Use the video frame descriptions, 
+audio transcriptions, and documents provided to give vivid, detailed analysis of the 
+moment the user is asking about. Reference specific timestamps when available.
+
+Each context chunk starts with [Source: filename]. Video scenes show chronological 
+frame descriptions grouped by time range — use the timeline to understand the flow of play.
         
-        {context}
+{context}
         
-        {question_block}
+{question_block}
         
-        At the end of your answer, explicitly list the unique source filenames you used to derive the answer, in the format:
-        Sources Used: filename1, filename2...
-        If no context was used, do not list sources.
-        """
+At the end of your answer, explicitly list the unique source filenames you used to derive the answer, in the format:
+Sources Used: filename1, filename2...
+If no context was used, do not list sources.
+"""
         prompt = ChatPromptTemplate.from_template(template)
         
         chain = (
@@ -174,19 +199,14 @@ class RAGPipeline:
         final_answer = answer_text
         sources_list = []
         
-        # Pattern to match "Sources Used:" or similar variations, case insensitive
-        # Matches: Sources Used:, Source Used:, Sources:, Source:
-        # capturing the rest of the line or text
         pattern = r"(?i)(\n|\r\n)\s*(?:\*\*|#+\s*)?Sources?\s*(?:Used)?\s*(?:\*\*|:)?\s*[:\-]?\s*(.*)"
         
         match = re.search(pattern, answer_text, re.DOTALL)
         if match:
-            # Everything before the match is the answer
             final_answer = answer_text[:match.start()].strip()
             sources_str = match.group(2).strip()
             
             if sources_str and sources_str.lower() != "none":
-                # Split by comma, strip whitespace, modify to simple basenames if needed
                 sources_list = [s.strip() for s in sources_str.split(',') if s.strip()]
 
         return {

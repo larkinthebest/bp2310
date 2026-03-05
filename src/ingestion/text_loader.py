@@ -1,6 +1,7 @@
 import os
 from typing import List, Dict, Any
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader, UnstructuredMarkdownLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 class UniversalTextLoader:
@@ -11,6 +12,13 @@ class UniversalTextLoader:
             '.docx': Docx2txtLoader,
             '.md': UnstructuredMarkdownLoader
         }
+        chunk_size = int(os.getenv("TEXT_CHUNK_SIZE", "1000"))
+        chunk_overlap = int(os.getenv("TEXT_CHUNK_OVERLAP", "200"))
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+        )
 
     def load_file(self, file_path: str) -> List[Document]:
         _, ext = os.path.splitext(file_path)
@@ -22,7 +30,12 @@ class UniversalTextLoader:
         loader_cls = self.loaders[ext]
         try:
             loader = loader_cls(file_path)
-            return loader.load()
+            docs = loader.load()
+            # Split into smaller, overlapping chunks for better retrieval precision
+            if docs:
+                docs = self.splitter.split_documents(docs)
+                print(f"  Split into {len(docs)} chunks (size={self.splitter._chunk_size}, overlap={self.splitter._chunk_overlap})")
+            return docs
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
             return []

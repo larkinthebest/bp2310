@@ -1,5 +1,8 @@
 import os
 import sys
+import time as _time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from dotenv import load_dotenv
 
@@ -19,6 +22,9 @@ from src.eval.metrics import check_ragas_metrics
 import json
 
 TRACKING_FILE = "processed_files.json"
+
+# Lock to protect concurrent access to the processed-files tracking JSON
+_tracking_lock = threading.Lock()
 
 
 def metric_value(scores: dict[str, Any], key: str) -> float:
@@ -46,6 +52,26 @@ def save_processed_file(filename):
     with open(TRACKING_FILE, 'w') as f:
         json.dump(list(processed), f)
 
+
+def _process_single_file(loader, vector_store, data_dir, filename):
+    """Process and ingest a single file. Returns (filename, success, error_msg)."""
+    file_path = os.path.join(data_dir, filename)
+    print(f"  ▶ Processing: {filename}...")
+    try:
+        documents = loader.load_file(file_path)
+        if documents:
+            vector_store.add_documents(documents)
+            with _tracking_lock:
+                save_processed_file(filename)
+            print(f"  ✅ Successfully ingested {filename}")
+            return (filename, True, None)
+        print(f"  ⚠ No documents extracted from {filename}")
+        return (filename, True, "No documents extracted")
+    except Exception as e:
+        print(f"  ❌ Error processing {filename}: {e}")
+        return (filename, False, str(e))
+
+
 def ingest_files(data_dir: str, vector_store: VectorStore):
     print(f"\n--- Ingestion Phase ---")
     if not os.path.exists(data_dir):
@@ -66,7 +92,8 @@ def ingest_files(data_dir: str, vector_store: VectorStore):
         print("All files in 'data/' have already been processed.")
         return
 
-    print(f"Found {len(files_to_process)} new files to process.")
+    max_workers = int(os.getenv("MAX_INGEST_WORKERS", "4"))
+    print(f"Found {len(files_to_process)} new files to process (workers={max_workers}).")
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -74,18 +101,26 @@ def ingest_files(data_dir: str, vector_store: VectorStore):
         return
         
     loader = MultimodalLoader(openai_api_key=openai_key)
-    
-    for filename in files_to_process:
-        file_path = os.path.join(data_dir, filename)
-        print(f"Processing: {filename}...")
-        try:
-            documents = loader.load_file(file_path)
-            if documents:
-                vector_store.add_documents(documents)
-                print(f"Successfully ingested {filename}")
-                save_processed_file(filename)
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
+
+    start_time = _time.time()
+    succeeded, failed = 0, 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_single_file, loader, vector_store, data_dir, fn): fn
+            for fn in files_to_process
+        }
+        for future in as_completed(futures):
+            filename, success, error = future.result()
+            if success:
+                succeeded += 1
+            else:
+                failed += 1
+
+    elapsed = _time.time() - start_time
+    print(f"\n--- Ingestion Complete ---")
+    print(f"  Total: {len(files_to_process)} | Succeeded: {succeeded} | Failed: {failed}")
+    print(f"  Time: {elapsed:.1f}s")
 
 def chat_loop(vector_store: VectorStore):
     print(f"\n--- Chat Phase ---")

@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from typing import List, Dict, Any
 from pinecone import Pinecone, ServerlessSpec
 from langchain_pinecone import PineconeVectorStore
@@ -45,6 +46,9 @@ class VectorStore:
         
         # Video Index (Direct Access)
         self.video_index = self.pc.Index(self.index_name_video)
+
+        # Lock for thread-safe video upserts
+        self._video_lock = threading.Lock()
 
     def _ensure_index(self, name, dimension):
         if name not in self.pc.list_indexes().names():
@@ -93,9 +97,10 @@ class VectorStore:
         if video_vectors:
             print(f"Adding {len(video_vectors)} video vectors to {self.index_name_video}...")
             batch_size = 100
-            for i in range(0, len(video_vectors), batch_size):
-                batch = video_vectors[i:i+batch_size]
-                self.video_index.upsert(vectors=batch)
+            with self._video_lock:
+                for i in range(0, len(video_vectors), batch_size):
+                    batch = video_vectors[i:i+batch_size]
+                    self.video_index.upsert(vectors=batch)
 
     def search(self, query: str, k: int = 3) -> Dict[str, List[Document]]:
         """Search across Text and Audio indexes using text query."""
@@ -109,7 +114,7 @@ class VectorStore:
         
         return results
 
-    def search_video(self, query_embedding: List[float], k: int = 3):
+    def search_video(self, query_embedding: List[float], k: int = 5):
         """Search Video index with a separate embedding (CLIP)."""
         return self.video_index.query(
             vector=query_embedding,
@@ -117,7 +122,7 @@ class VectorStore:
             include_metadata=True
         )
 
-    def rerank(self, query: str, documents: List[str], top_n: int = 3) -> List[Dict[str, Any]]:
+    def rerank(self, query: str, documents: List[str], top_n: int = 5) -> List[Dict[str, Any]]:
         """
         Rerank documents using Pinecone's reranker model.
         
@@ -150,4 +155,3 @@ class VectorStore:
             print(f"Warning: Reranking failed: {e}. Returning original order.")
             # Fallback: return documents in original order with dummy scores
             return [{"index": i, "score": 1.0} for i in range(min(top_n, len(documents)))]
-
