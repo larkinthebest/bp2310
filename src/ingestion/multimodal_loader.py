@@ -57,7 +57,7 @@ class MultimodalLoader:
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
                     ]
                 }],
-                max_completion_tokens=300,
+                max_completion_tokens=500,
             )
             message_content = resp.choices[0].message.content
             if isinstance(message_content, list):

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sports AI Commentator</title>
+    <meta name="description" content="AI-powered sports video analysis and commentary system">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Sidebar -->
+<aside class="sidebar">
+    <div class="sidebar-header">
+        <h1>⚽ Sports AI</h1>
+        <p>Commentator &amp; Analyst</p>
+    </div>
+
+    <div class="sidebar-section">
+        <h2>Data Files</h2>
+        <label class="select-all-label">
+            <input type="checkbox" id="selectAll" checked onchange="toggleSelectAll()">
+            <span>All</span>
+        </label>
+    </div>
+    <div class="file-list" id="fileList">
+        <div class="file-item" style="color: var(--text-muted);">Loading...</div>
+    </div>
+
+    <div class="ingest-status" id="ingestStatus"></div>
+    <!-- Hidden file input for upload -->
+    <input type="file" id="fileUploadInput" multiple hidden
+           accept=".mp4,.avi,.mov,.mkv,.pdf,.txt,.docx,.md,.mp3,.wav,.png,.jpg,.jpeg">
+    <button class="btn-ingest" id="btnIngest" onclick="document.getElementById('fileUploadInput').click()">
+        ⚡ Upload &amp; Ingest Files
+    </button>
+</aside>
+
+<!-- Main Chat Area -->
+<main class="main">
+    <div class="chat-container" id="chatContainer">
+        <div class="welcome" id="welcome">
+            <div class="welcome-icon">🏟️</div>
+            <h2>Sports AI Commentator</h2>
+            <p>Upload video files and documents, then ask me about any moment. I'll analyze the action and show you the key frames.</p>
+        </div>
+    </div>
+
+    <div class="input-bar">
+        <div class="input-wrapper">
+            <input type="text" id="chatInput" placeholder="Ask about a moment in the match..." 
+                   autocomplete="off" autofocus>
+            <button class="btn-send" id="btnSend" onclick="sendMessage()">➤</button>
+        </div>
+    </div>
+</main>
+
+<!-- Lightbox (image or video) -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox(event)">
+    <div class="lightbox-content" id="lightboxContent"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
