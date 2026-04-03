@@ -63,6 +63,26 @@ body {
     text-transform: uppercase;
 }
 
+.btn-new-chat {
+    margin-top: 12px;
+    width: 100%;
+    padding: 8px;
+    background: var(--bg-glass);
+    border: 1px dashed var(--border-color);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-new-chat:hover {
+    border-color: var(--accent);
+    color: var(--accent-hover);
+    background: var(--accent-glow);
+}
+
 .sidebar-section {
     padding: 16px 20px 8px;
     display: flex;

@@ -17,6 +17,20 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('fileUploadInput').addEventListener('change', handleFileUpload);
 });
 
+// ── New Chat ─────────────────────────────────────────────────────
+
+function newChat() {
+    chatHistory = [];
+    const container = document.getElementById('chatContainer');
+    container.innerHTML = `
+        <div class="welcome" id="welcome">
+            <div class="welcome-icon">🏟️</div>
+            <h2>Sports AI Commentator</h2>
+            <p>Upload video files and documents, then ask me about any moment. I'll analyze the action and show you the key frames.</p>
+        </div>
+    `;
+}
+
 // ── File Upload ──────────────────────────────────────────────────
 
 async function handleFileUpload(e) {
@@ -236,13 +250,20 @@ function addAIMessage(data) {
     div.className = 'message message-ai';
     const msgId = 'msg-' + Date.now();
 
-    // Format answer — convert [Frame: Xs] into clickable badges
+    // Format answer — convert markdown and [Frame: Xs] into clickable badges
     let answerHtml = data.answer.split('\n').filter(p => p.trim()).map(p => {
         let escaped = escapeHtml(p);
+        // Simple markdown: **bold**, `code`
+        escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        escaped = escaped.replace(/`(.+?)`/g, '<code>$1</code>');
         // Replace [Frame: 24s] with clickable badges that open video
         escaped = escaped.replace(/\[Frame:\s*(\d+(?:\.\d+)?)s?\]/gi, (match, ts) => {
             return `<a class="frame-badge" onclick="highlightFrame('${msgId}', ${ts})" title="Jump to frame">⏱ ${formatTimestamp(parseFloat(ts))}</a>`;
         });
+        // Bullet list items
+        if (escaped.startsWith('- ') || escaped.startsWith('• ')) {
+            return `<li>${escaped.substring(2)}</li>`;
+        }
         return `<p>${escaped}</p>`;
     }).join('');
 

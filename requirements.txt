@@ -2,6 +2,7 @@ langchain
 langchain-openai
 langchain-community
 langchain-pinecone
+langchain-text-splitters
 pinecone>=5.1.0
 langfuse
 ragas
@@ -9,6 +10,7 @@ openai
 tiktoken
 pypdf
 python-docx
+docx2txt
 moviepy<2.0.0
 openai-whisper
 python-dotenv
@@ -20,4 +22,7 @@ torch
 pillow
 fastapi
 uvicorn[standard]
-
+python-multipart
+datasets
+google-generativeai
+langchain-google-genai

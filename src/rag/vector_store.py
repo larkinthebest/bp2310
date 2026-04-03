@@ -1,157 +1,209 @@
-import os
-import time
+"""
+Vector store layer — Pinecone index management, storage, retrieval, reranking.
+
+Design decisions:
+  - Deterministic vector IDs (hash of source + modality + timestamp/chunk_index).
+  - Index provisioning is separated into `ensure_indexes()` — called explicitly.
+  - Rerank fallback is explicit: returns `rerank_applied=False` on failure.
+  - Retrieval returns scores when available.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
 import threading
-from typing import List, Dict, Any
-from pinecone import Pinecone, ServerlessSpec
-from langchain_pinecone import PineconeVectorStore
-from langchain_openai import OpenAIEmbeddings
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
 from langchain_core.documents import Document
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
+
+from src.config import cfg
+
+logger = logging.getLogger(__name__)
+
+
+# ── Result types ──────────────────────────────────────────────────
+
+@dataclass
+class RerankResult:
+    """Outcome of a reranking attempt."""
+    items: List[Dict[str, Any]]
+    rerank_applied: bool = True
+    fallback_reason: str | None = None
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _make_vector_id(source: str, modality: str, index: int = 0, timestamp: float | None = None) -> str:
+    """Build a stable, deterministic ID for a Pinecone vector."""
+    parts = [source, modality, str(index)]
+    if timestamp is not None:
+        parts.append(f"t{timestamp}")
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+# ── VectorStore ───────────────────────────────────────────────────
 
 class VectorStore:
-    def __init__(self):
-        self.api_key = os.getenv("PINECONE_API_KEY")
-        if not self.api_key:
-            raise ValueError("PINECONE_API_KEY not found in environment variables")
-        
-        self.cloud = os.getenv("PINECONE_CLOUD", "aws")
-        self.region = os.getenv("PINECONE_REGION", "us-east-1")
-            
-        self.pc = Pinecone(api_key=self.api_key)
-        
-        # Load Index Names from Env
-        self.index_name_text = os.getenv("PINECONE_INDEX_TEXT", "multimodal-rag-text")
-        self.index_name_audio = os.getenv("PINECONE_INDEX_AUDIO", "multimodal-rag-audio")
-        self.index_name_video = os.getenv("PINECONE_INDEX_VIDEO", "multimodal-rag-video")
-        
-        # Ensure Indexes Exist
-        # Text & Audio use OpenAI Embeddings (1536)
-        self._ensure_index(self.index_name_text, 1536)
-        self._ensure_index(self.index_name_audio, 1536)
-        
-        # Video uses CLIP Embeddings (768)
-        self._ensure_index(self.index_name_video, 768)
-        
-        # Initialize Embeddings
-        self.text_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        
-        # Initialize LangChain Wrappers
+    def __init__(self, *, auto_provision: bool = True):
+        if not cfg.pinecone_api_key:
+            raise ValueError("PINECONE_API_KEY not set")
+
+        self.pc = Pinecone(api_key=cfg.pinecone_api_key)
+
+        self.index_name_text = cfg.pinecone_index_text
+        self.index_name_audio = cfg.pinecone_index_audio
+        self.index_name_video = cfg.pinecone_index_video
+
+        if auto_provision:
+            self.ensure_indexes()
+
+        # Select embeddings based on provider
+        if cfg.is_google:
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+            self.text_embeddings = GoogleGenerativeAIEmbeddings(
+                model=cfg.embedding_model,
+                google_api_key=cfg.google_api_key,
+            )
+        else:
+            from langchain_openai import OpenAIEmbeddings
+            self.text_embeddings = OpenAIEmbeddings(model=cfg.embedding_model)
+
+        # LangChain wrappers for text/audio
         self.text_store = PineconeVectorStore(
             index_name=self.index_name_text,
-            embedding=self.text_embeddings
+            embedding=self.text_embeddings,
         )
         self.audio_store = PineconeVectorStore(
             index_name=self.index_name_audio,
-            embedding=self.text_embeddings
+            embedding=self.text_embeddings,
         )
-        
-        # Video Index (Direct Access)
-        self.video_index = self.pc.Index(self.index_name_video)
 
-        # Lock for thread-safe video upserts
+        # Direct video index handle
+        self.video_index = self.pc.Index(self.index_name_video)
         self._video_lock = threading.Lock()
 
-    def _ensure_index(self, name, dimension):
-        if name not in self.pc.list_indexes().names():
-            print(f"Creating Pinecone index: {name}")
-            self.pc.create_index(
-                name=name,
-                dimension=dimension,
-                metric="cosine",
-                spec=ServerlessSpec(cloud=self.cloud, region=self.region)
-            )
-            while not self.pc.describe_index(name).status['ready']:
-                time.sleep(1)
+    # ── Provisioning (separate from runtime) ──────────────────────
 
-    def add_documents(self, documents: List[Document]):
-        text_docs = []
-        audio_docs = []
-        video_vectors = []
-        
+    def ensure_indexes(self) -> None:
+        """Create Pinecone indexes if they do not exist. Safe to call multiple times."""
+        emb_dim = cfg.embedding_dimension
+        self._ensure_index(self.index_name_text, emb_dim)
+        self._ensure_index(self.index_name_audio, emb_dim)
+        self._ensure_index(self.index_name_video, 768)  # CLIP is always 768
+
+    def _ensure_index(self, name: str, dimension: int) -> None:
+        existing = self.pc.list_indexes().names()
+        if name in existing:
+            return
+        logger.info("Creating Pinecone index: %s (dim=%d)", name, dimension)
+        self.pc.create_index(
+            name=name,
+            dimension=dimension,
+            metric="cosine",
+            spec=ServerlessSpec(cloud=cfg.pinecone_cloud, region=cfg.pinecone_region),
+        )
+        while not self.pc.describe_index(name).status["ready"]:
+            time.sleep(1)
+        logger.info("Index %s ready", name)
+
+    # ── Storage ───────────────────────────────────────────────────
+
+    def add_documents(self, documents: List[Document]) -> None:
+        text_docs: list[Document] = []
+        audio_docs: list[Document] = []
+        video_vectors: list[dict] = []
+
+        frame_counter: dict[str, int] = {}  # per-source frame counter
+
         for doc in documents:
             doc_type = doc.metadata.get("type", "text")
-            
+
             if "embedding" in doc.metadata:
-                # Video Frame / Image with pre-computed embedding
-                vector_id = f"{doc.metadata.get('source', 'unknown')}_{time.time()}_{len(video_vectors)}"
+                source = doc.metadata.get("source", "unknown")
+                ts = doc.metadata.get("timestamp")
+                idx = frame_counter.get(source, 0)
+                frame_counter[source] = idx + 1
+
+                vector_id = _make_vector_id(source, doc_type, idx, ts)
                 video_vectors.append({
                     "id": vector_id,
                     "values": doc.metadata["embedding"],
                     "metadata": {
                         **{k: v for k, v in doc.metadata.items() if k != "embedding"},
-                        "caption": doc.page_content
-                    }
+                        "caption": doc.page_content,
+                    },
                 })
-            elif doc_type == "audio" or doc_type == "video_audio":
+            elif doc_type in ("audio", "video_audio"):
                 audio_docs.append(doc)
             else:
                 text_docs.append(doc)
-        
+
         if text_docs:
-            print(f"Adding {len(text_docs)} text documents to {self.index_name_text}...")
+            logger.info("Adding %d text docs → %s", len(text_docs), self.index_name_text)
             self.text_store.add_documents(text_docs)
-            
+
         if audio_docs:
-            print(f"Adding {len(audio_docs)} audio documents to {self.index_name_audio}...")
+            logger.info("Adding %d audio docs → %s", len(audio_docs), self.index_name_audio)
             self.audio_store.add_documents(audio_docs)
-            
+
         if video_vectors:
-            print(f"Adding {len(video_vectors)} video vectors to {self.index_name_video}...")
+            logger.info("Adding %d video vectors → %s", len(video_vectors), self.index_name_video)
             batch_size = 100
             with self._video_lock:
                 for i in range(0, len(video_vectors), batch_size):
-                    batch = video_vectors[i:i+batch_size]
-                    self.video_index.upsert(vectors=batch)
+                    self.video_index.upsert(vectors=video_vectors[i : i + batch_size])
+
+    # ── Retrieval ─────────────────────────────────────────────────
 
     def search(self, query: str, k: int = 3) -> Dict[str, List[Document]]:
-        """Search across Text and Audio indexes using text query."""
-        results = {}
-        
-        # Search Text
-        results["text"] = self.text_store.similarity_search(query, k=k)
-        
-        # Search Audio
-        results["audio"] = self.audio_store.similarity_search(query, k=k)
-        
-        return results
+        """Search text and audio indexes."""
+        return {
+            "text": self.text_store.similarity_search(query, k=k),
+            "audio": self.audio_store.similarity_search(query, k=k),
+        }
 
-    def search_video(self, query_embedding: List[float], k: int = 5):
-        """Search Video index with a separate embedding (CLIP)."""
+    def search_video(self, query_embedding: List[float], k: int = 5) -> dict:
+        """Search the video index with a CLIP embedding."""
         return self.video_index.query(
             vector=query_embedding,
             top_k=k,
-            include_metadata=True
+            include_metadata=True,
         )
 
-    def rerank(self, query: str, documents: List[str], top_n: int = 5) -> List[Dict[str, Any]]:
+    # ── Reranking ─────────────────────────────────────────────────
+
+    def rerank(self, query: str, documents: List[str], top_n: int = 5) -> RerankResult:
         """
-        Rerank documents using Pinecone's reranker model.
-        
-        Args:
-            query: The search query
-            documents: List of document texts to rerank
-            top_n: Number of top results to return
-            
-        Returns:
-            List of reranked results with 'index' and 'score' keys
+        Rerank documents using Pinecone's reranker.
+        Returns a RerankResult with explicit `rerank_applied` flag.
         """
         if not documents:
-            return []
-        
-        # Truncate documents to ~800 chars to stay under 1024 token limit
+            return RerankResult(items=[], rerank_applied=False, fallback_reason="empty input")
+
         max_chars = 800
-        truncated_docs = [doc[:max_chars] if len(doc) > max_chars else doc for doc in documents]
-        
+        truncated = [d[:max_chars] for d in documents]
+
         try:
             results = self.pc.inference.rerank(
                 model="bge-reranker-v2-m3",
                 query=query,
-                documents=truncated_docs,
+                documents=truncated,
                 top_n=top_n,
-                return_documents=True
+                return_documents=True,
             )
-            # Convert to list of dicts for consistent access
-            return [{"index": r.index, "score": r.score} for r in results.data]
+            items = [{"index": r.index, "score": r.score} for r in results.data]
+            return RerankResult(items=items, rerank_applied=True)
         except Exception as e:
-            print(f"Warning: Reranking failed: {e}. Returning original order.")
-            # Fallback: return documents in original order with dummy scores
-            return [{"index": i, "score": 1.0} for i in range(min(top_n, len(documents)))]
+            logger.warning("Reranking failed: %s — returning original order", e)
+            items = [{"index": i, "score": 0.0} for i in range(min(top_n, len(documents)))]
+            return RerankResult(
+                items=items,
+                rerank_applied=False,
+                fallback_reason=str(e),
+            )

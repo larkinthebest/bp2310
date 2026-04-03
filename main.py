@@ -1,251 +1,193 @@
+"""
+CLI entry point for the Multimodal RAG system.
+
+Default chat is simple: one query → one answer.
+Benchmark mode (--benchmark) adds A/B reranking comparison + RAGAS metrics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
 import os
 import sys
-import time as _time
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
-from dotenv import load_dotenv
 
-# Load env before imports
-print("DEBUG: Loading .env file...")
-load_dotenv()
-
-print("DEBUG: Importing MultimodalLoader...")
+from src.config import cfg
 from src.ingestion.multimodal_loader import MultimodalLoader
-print("DEBUG: Importing VectorStore...")
 from src.rag.vector_store import VectorStore
-print("DEBUG: Importing RAGPipeline...")
 from src.rag.pipeline import RAGPipeline
-print("DEBUG: Importing Metrics...")
-from src.eval.metrics import check_ragas_metrics
 
-import json
-
-TRACKING_FILE = "processed_files.json"
-
-# Lock to protect concurrent access to the processed-files tracking JSON
+TRACKING_FILE = cfg.tracking_file
 _tracking_lock = threading.Lock()
 
 
-def metric_value(scores: dict[str, Any], key: str) -> float:
-    value = scores.get(key, 0.0)
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-def load_processed_files():
+def load_processed_files() -> set:
     if os.path.exists(TRACKING_FILE):
         try:
-            with open(TRACKING_FILE, 'r') as f:
+            with open(TRACKING_FILE, "r") as f:
                 return set(json.load(f))
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warning: Could not load tracking file: {e}")
+        except (json.JSONDecodeError, IOError):
             return set()
     return set()
 
-def save_processed_file(filename):
+
+def save_processed_file(filename: str):
     processed = load_processed_files()
     processed.add(filename)
-    with open(TRACKING_FILE, 'w') as f:
+    with open(TRACKING_FILE, "w") as f:
         json.dump(list(processed), f)
 
 
-def _process_single_file(loader, vector_store, data_dir, filename):
-    """Process and ingest a single file. Returns (filename, success, error_msg)."""
+def _process_single_file(loader, vs, data_dir, filename):
     file_path = os.path.join(data_dir, filename)
-    print(f"  ▶ Processing: {filename}...")
     try:
         documents = loader.load_file(file_path)
         if documents:
-            vector_store.add_documents(documents)
+            vs.add_documents(documents)
             with _tracking_lock:
                 save_processed_file(filename)
-            print(f"  ✅ Successfully ingested {filename}")
-            return (filename, True, None)
-        print(f"  ⚠ No documents extracted from {filename}")
-        return (filename, True, "No documents extracted")
+            print(f"  ✅ {filename}")
+            return filename, True, None
+        return filename, True, "No documents"
     except Exception as e:
-        print(f"  ❌ Error processing {filename}: {e}")
-        return (filename, False, str(e))
+        print(f"  ❌ {filename}: {e}")
+        return filename, False, str(e)
 
 
 def ingest_files(data_dir: str, vector_store: VectorStore):
-    print(f"\n--- Ingestion Phase ---")
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-        print(f"Created directory: {data_dir}")
-        print("Please add files to this directory and try again.")
-        return
+    print("\n--- Ingestion Phase ---")
+    os.makedirs(data_dir, exist_ok=True)
 
     all_files = [f for f in os.listdir(data_dir) if os.path.isfile(os.path.join(data_dir, f))]
-    if not all_files:
-        print(f"No files found in {data_dir}. Please add .txt, .pdf, .mp3, .mp4 files.")
+    processed = load_processed_files()
+    to_process = [f for f in all_files if f not in processed]
+
+    if not to_process:
+        print("All files already processed.")
         return
 
-    processed_files = load_processed_files()
-    files_to_process = [f for f in all_files if f not in processed_files]
-    
-    if not files_to_process:
-        print("All files in 'data/' have already been processed.")
-        return
-
-    max_workers = int(os.getenv("MAX_INGEST_WORKERS", "4"))
-    print(f"Found {len(files_to_process)} new files to process (workers={max_workers}).")
-
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
+    if not cfg.openai_api_key:
         print("Error: OPENAI_API_KEY not set.")
         return
-        
-    loader = MultimodalLoader(openai_api_key=openai_key)
 
-    start_time = _time.time()
-    succeeded, failed = 0, 0
+    loader = MultimodalLoader()
+    max_workers = cfg.max_ingest_workers
+    print(f"Processing {len(to_process)} files (workers={max_workers})…")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_process_single_file, loader, vector_store, data_dir, fn): fn
-            for fn in files_to_process
-        }
+    start = time.time()
+    ok = fail = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_single_file, loader, vector_store, data_dir, fn): fn for fn in to_process}
         for future in as_completed(futures):
-            filename, success, error = future.result()
+            _, success, _ = future.result()
             if success:
-                succeeded += 1
+                ok += 1
             else:
-                failed += 1
+                fail += 1
 
-    elapsed = _time.time() - start_time
-    print(f"\n--- Ingestion Complete ---")
-    print(f"  Total: {len(files_to_process)} | Succeeded: {succeeded} | Failed: {failed}")
-    print(f"  Time: {elapsed:.1f}s")
+    print(f"\n--- Done in {time.time() - start:.1f}s — {ok} succeeded, {fail} failed ---")
 
-def chat_loop(vector_store: VectorStore):
-    print(f"\n--- Chat Phase ---")
-    print("Initializing RAG Pipeline (loading CLIP model for query embedding)...")
+
+def chat_loop(vector_store: VectorStore, *, benchmark: bool = False):
+    print("\n--- Chat Mode ---")
     pipeline = RAGPipeline(vector_store)
-    
-    print("\nSystem Ready. Type 'exit' to return to menu.")
+
+    if benchmark:
+        print("(Benchmark mode: comparing standard vs reranked retrieval)")
+        _run_benchmark_chat(pipeline)
+    else:
+        _run_simple_chat(pipeline)
+
+
+def _run_simple_chat(pipeline: RAGPipeline):
+    print("Type 'exit' to return.\n")
     while True:
-        question = input("\nYou: ")
-        if question.lower() in ['exit', 'quit']:
+        question = input("You: ").strip()
+        if question.lower() in ("exit", "quit"):
             break
-        
         try:
-            print("Thinking...")
-            
-            # === Standard Retrieval (No Reranking) ===
-            print("\n" + "="*50)
-            print("=== STANDARD RETRIEVAL (No Reranking) ===")
-            print("="*50)
-            
-            result_standard = pipeline.query(question, use_reranking=False)
-            answer_standard = result_standard["answer"]
-            contexts_standard = result_standard["contexts"]
-            sources_standard = result_standard.get("sources", [])
-            
-            print(f"\nAI: {answer_standard}")
-            if sources_standard:
-                print(f"Sources: {', '.join(sources_standard)}")
-            
-            print("\nComputing RAGAS Metrics...")
-            scores_standard = check_ragas_metrics(question, answer_standard, contexts_standard)
-            
-            if "error" in scores_standard:
-                print(f"RAGAS Error: {scores_standard['error']}")
-                faith_std = rel_std = prec_std = rec_std = 0.0
-            else:
-                faith_std = metric_value(scores_standard, "faithfulness")
-                rel_std = metric_value(scores_standard, "answer_relevancy")
-                prec_std = metric_value(scores_standard, "context_precision")
-                rec_std = metric_value(scores_standard, "context_recall")
-                
-                print(f"Faithfulness: {faith_std:.4f} | Relevancy: {rel_std:.4f}")
-                print(f"Context Precision: {prec_std:.4f} | Context Recall: {rec_std:.4f}")
-            
-            # === Reranker-Enhanced Retrieval ===
-            print("\n" + "="*50)
-            print("=== RERANKER-ENHANCED RETRIEVAL ===")
-            print("="*50)
-            
-            result_reranked = pipeline.query(question, use_reranking=True)
-            answer_reranked = result_reranked["answer"]
-            contexts_reranked = result_reranked["contexts"]
-            sources_reranked = result_reranked.get("sources", [])
-            
-            print(f"\nAI: {answer_reranked}")
-            if sources_reranked:
-                print(f"Sources: {', '.join(sources_reranked)}")
-            
-            print("\nComputing RAGAS Metrics...")
-            scores_reranked = check_ragas_metrics(question, answer_reranked, contexts_reranked)
-            
-            if "error" in scores_reranked:
-                print(f"RAGAS Error: {scores_reranked['error']}")
-                faith_rr = rel_rr = prec_rr = rec_rr = 0.0
-            else:
-                faith_rr = metric_value(scores_reranked, "faithfulness")
-                rel_rr = metric_value(scores_reranked, "answer_relevancy")
-                prec_rr = metric_value(scores_reranked, "context_precision")
-                rec_rr = metric_value(scores_reranked, "context_recall")
-                
-                print(f"Faithfulness: {faith_rr:.4f} | Relevancy: {rel_rr:.4f}")
-                print(f"Context Precision: {prec_rr:.4f} | Context Recall: {rec_rr:.4f}")
-            
-            # === Comparison Summary ===
-            print("\n" + "="*50)
-            print("=== COMPARISON SUMMARY ===")
-            print("="*50)
-            
-            faith_diff = faith_rr - faith_std
-            rel_diff = rel_rr - rel_std
-            
-            print(f"Faithfulness: Standard={faith_std:.4f} | Reranked={faith_rr:.4f} | Diff={faith_diff:+.4f}")
-            print(f"Relevancy:    Standard={rel_std:.4f} | Reranked={rel_rr:.4f} | Diff={rel_diff:+.4f}")
-            
-            # Determine winner
-            if rel_rr > rel_std and faith_rr >= faith_std:
-                print("\n✅ Reranker improved the answer quality!")
-            elif rel_std > rel_rr and faith_std >= faith_rr:
-                print("\n⚠️ Standard retrieval performed better this time.")
-            else:
-                print("\n➡️ Mixed results - check individual metrics above.")
-                
+            result = pipeline.query(question)
+            print(f"\nAI: {result.answer}")
+            if result.sources:
+                print(f"Sources: {', '.join(result.sources)}")
+            print()
         except Exception as e:
-            print(f"Error during query: {repr(e)}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error: {e}\n")
+
+
+def _run_benchmark_chat(pipeline: RAGPipeline):
+    """A/B comparison with optional RAGAS — expensive, for development only."""
+    try:
+        from src.eval.metrics import check_ragas_metrics
+    except ImportError:
+        print("Warning: RAGAS not available. Install 'ragas' to use benchmark mode.")
+        _run_simple_chat(pipeline)
+        return
+
+    print("Type 'exit' to return.\n")
+    while True:
+        question = input("You: ").strip()
+        if question.lower() in ("exit", "quit"):
+            break
+
+        try:
+            # Standard
+            print("\n=== STANDARD (no reranking) ===")
+            r1 = pipeline.query(question, use_reranking=False)
+            print(f"AI: {r1.answer}")
+
+            # Reranked
+            print("\n=== RERANKED ===")
+            r2 = pipeline.query(question, use_reranking=True)
+            print(f"AI: {r2.answer}")
+            print(f"  (rerank applied: {r2.rerank_applied})")
+
+            # RAGAS
+            print("\nComputing RAGAS metrics…")
+            s1 = check_ragas_metrics(question, r1.answer, r1.contexts)
+            s2 = check_ragas_metrics(question, r2.answer, r2.contexts)
+
+            print(f"Standard  — {s1}")
+            print(f"Reranked  — {s2}")
+            print()
+        except Exception as e:
+            print(f"Error: {e}\n")
+
 
 def main():
-    print("Initializing Vector Store...")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+
+    parser = argparse.ArgumentParser(description="Multimodal RAG CLI")
+    parser.add_argument("--benchmark", action="store_true", help="Enable A/B benchmark mode with RAGAS")
+    args = parser.parse_args()
+
     try:
         vector_store = VectorStore()
     except Exception as e:
-        print(f"Failed to initialize VectorStore: {e}")
-        print("Check your .env configuration.")
+        print(f"Failed to init VectorStore: {e}")
         return
 
-    data_dir = os.path.join(os.getcwd(), "data")
+    data_dir = cfg.data_dir
 
     while True:
         print("\n=== Multimodal RAG CLI ===")
-        print("1. Ingest Files from 'data/'")
-        print("2. Chat with your Data")
+        print("1. Ingest files from 'data/'")
+        print("2. Chat")
         print("3. Exit")
-        
-        choice = input("Select option (1-3): ")
-        
-        if choice == '1':
+
+        choice = input("Select (1-3): ").strip()
+        if choice == "1":
             ingest_files(data_dir, vector_store)
-        elif choice == '2':
-            chat_loop(vector_store)
-        elif choice == '3':
+        elif choice == "2":
+            chat_loop(vector_store, benchmark=args.benchmark)
+        elif choice == "3":
             print("Goodbye!")
             break
-        else:
-            print("Invalid option. Try again.")
+
 
 if __name__ == "__main__":
     main()
