@@ -14,4 +14,4 @@ data/*.mp4
 
 processed_files.json
 
-*.pdf
+data/*.pdf
